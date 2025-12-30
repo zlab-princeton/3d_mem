@@ -1,0 +1,141 @@
+name: "CustomDiT_Text_Top16_NoAug_FlowMatching_1024x32"
+
+sampling_common: &sampling_common
+  bounds: [-1.01, -1.01, -1.01, 1.01, 1.01, 1.01]
+  octree_depth: 8        # callback will convert to octree_resolution=256
+  num_chunks: 50000
+  mc_level: 0.0
+
+training:
+  steps: 500000
+  use_amp: true
+  amp_type: "bf16"
+  base_lr: 1e-4
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
+  every_n_train_steps: 5000
+  val_check_interval: 4999   # How often to run validation
+  limit_val_batches: 4
+  update_every: 2
+
+dataset:
+  target: hy3dshape.data.datamodule.UnifiedDataModule
+  params:
+    mode: "latent" # "raw"
+    batch_size: 64 # global batch size 512 (for baseline, we train under 4 H100, with gradient accumulation 2)
+    num_workers: 8
+    max_dataset_size: 51200
+    dataset_type: "objaverse_lvis"
+    
+    # Fill these in with your actual paths
+    # dataset_folder:
+    # val_dataset_folder:
+    train_latent_folder: PATH/TO/TRAIN_LATENTS
+    val_latent_folder:  PATH/TO/VAL_LATENTS
+
+
+    train_csv_path: utils/lvis/top16/train.csv
+    val_csv_path: utils/lvis/top16/val.csv
+
+    conditioning_type: "text" # Can be "class" or "uncond"
+    snapshot_dir: ./splits/16-class # used for caching the training data.
+
+model:
+  target: hy3dshape.models.diffusion.flow_matching_sit.Diffuser
+  params:
+    scale_by_std: true
+    z_scale_factor: 1.0 # will be re-set by first batch statistics
+    torch_compile: true
+    
+    first_stage_config:
+      target: hy3dshape.models.autoencoders.autoencoder.CustomShapeVAE
+      params:
+        # Parameters for VAE
+        model_depth: 24
+        model_dim: 1024
+        surface_size: 8192
+        num_latents: 1024
+        latent_dim: 32
+        query_type: 'point'
+        bottleneck: 'normalized'
+
+        pretrained:
+          ckpt_path: '/PATH/TO/point_vec1024x32_dim1024_depth24_sdf_nb/checkpoint-110.pth' # https://github.com/1zb/VecSetX
+          ckpt_key: "model"
+          strip_prefixes: ["module."]
+          target_submodule: "autoencoder"
+
+    cond_stage_config:
+      target: hy3dshape.models.conditioner.MultiConditioner
+      params:
+        type: "text" # Must match dataset.conditioning_type
+        # If type: "class", you would need to add:
+        # num_classes: 16 
+        text_embed_dim: 512
+        p_uncond: 0.1
+
+    denoiser_cfg:
+      target: hy3dshape.models.denoisers.dit.DiTPlain
+      params:
+        in_channels: 32   
+        max_seq_len: 1024 
+
+        # Text encoder: CLIP ViT-B/16
+        context_dim: 512
+        text_len: 77
+        
+        # Model architecture
+        hidden_size: 1024
+        depth: 12
+        num_heads: 16
+        qk_norm: true
+        use_attention_pooling: false
+        use_pos_emb: false
+        qk_norm_type: 'rms'
+        num_moe_layers: 3
+        num_experts: 4
+        moe_top_k: 2 
+
+    scheduler_cfg:
+      transport:
+        target: hy3dshape.models.diffusion.transport.create_transport
+        params:
+          path_type: Linear
+          prediction: velocity
+      sampler:
+        target: hy3dshape.models.diffusion.transport.Sampler
+        params: {}
+        ode_params:
+          sampling_method: euler
+          num_steps: &num_steps 50
+
+
+    optimizer_cfg:
+      # NOT TRAINABLE CONDITIONING ENCODER
+      # train_image_encoder: true
+      # image_encoder_lr_multiply: 0.1 
+      optimizer:
+        target: torch.optim.AdamW
+        params:
+          fused: true
+          betas: [0.9, 0.99]
+          eps: 1.e-6
+          weight_decay: 1.e-2
+      scheduler:
+        target: hy3dshape.utils.trainings.lr_scheduler.LambdaWarmUpCosineFactorScheduler
+        params:
+          warm_up_steps: 500
+          f_start: 1.e-6
+          f_min: 1.e-3
+          f_max: 1.0
+          
+    pipeline_cfg:
+      target: hy3dshape.pipelines.CustomFlowMatchingPipeline
+
+callbacks:
+  mesh_logger:
+    target: hy3dshape.utils.trainings.mesh_log_callback.ConditionalMeshLogger
+    params:
+      step_frequency: 4999
+      num_samples: 4
+      <<: *sampling_common

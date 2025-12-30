@@ -1,0 +1,126 @@
+name: "ImgLatents_DiT_TextCond_FM_256x256"
+
+training:
+  steps: 500000
+  use_amp: true
+  amp_type: "bf16"
+  base_lr: 1.e-4
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
+  every_n_train_steps: 3000
+  val_check_interval: 2999
+  limit_val_batches: 4
+  update_every: 2
+
+dataset:
+  target: hy3dshape.data.datamodule.UnifiedDataModule
+  params:
+    mode: "latent"
+    batch_size: 64
+    num_workers: 8
+    max_dataset_size: 51200
+    dataset_type: "objaverse_lvis"
+
+    train_latent_folder: PATH/TO/Flux256x256_v12
+    val_latent_folder:   PATH/TO/Flux256x256_v12
+
+    train_csv_path: utils/lvis/top100/train.csv  # <-- set me
+    val_csv_path:   utils/lvis/top100/val.csv    # <-- set me
+
+    # LatentImageDataset specifics
+    latent_is_image: true
+    conditioning_type: "text"      # {"uncond","text","lvis"}
+    expect_hw: 32                  # FluxVAE → 256/8
+    expect_c: 16                   # FluxVAE latent channels
+    flatten_to_tokens: true        # (C,H,W) -> (T,C) with T=H*W
+    train_view_policy: "center"    # deterministic training view
+    val_view_policy: "center"      # deterministic validation view
+
+model:
+  target: hy3dshape.models.diffusion.flow_matching_sit.Diffuser
+  params:
+    scale_by_std: true
+    z_scale_factor: 1.0
+    torch_compile: true
+
+    # image VAE
+    first_stage_config:
+      target: hy3dshape.models.autoencoders.image_encoder.FluxVAE
+      params:
+        pretrained_path: /home/sp2526/flux/ckpt/vae   # <-- set to actual vae path
+        dtype: "bf16"
+        freeze: true
+        enforce_fp32: false
+
+    # conditioner
+    cond_stage_config:
+      target: hy3dshape.models.conditioner.MultiConditioner
+      params:
+        type: "text"
+        text_embed_dim: 512
+        p_uncond: 0.1
+
+    denoiser_cfg:
+      target: hy3dshape.models.denoisers.dit.DiTPlain
+      params:
+        in_channels: 16
+        max_seq_len: 1024
+        grid_size: 32               # for 2D pos enc
+        context_dim: 512
+        text_len: 77
+        hidden_size: 1024
+        depth: 12
+        num_heads: 16
+
+        qk_norm: true
+        qk_norm_type: "rms"
+        qkv_bias: true
+        use_pos_emb: true
+        pos_emb_type: "2d"          # uses get_2d_sincos_pos_embed(grid_size)
+        use_attention_pooling: false
+        num_moe_layers: 3
+        num_experts: 4
+        moe_top_k: 2
+
+    scheduler_cfg:
+      transport:
+        target: hy3dshape.models.diffusion.transport.create_transport
+        params:
+          path_type: Linear
+          prediction: velocity
+      sampler:
+        target: hy3dshape.models.diffusion.transport.Sampler
+        params: {}
+        ode_params:
+          sampling_method: euler
+          num_steps: &num_steps 50
+
+    optimizer_cfg:
+      # train_image_encoder: true    
+      # image_encoder_lr_multiply: 0.1
+      optimizer:
+        target: torch.optim.AdamW
+        params:
+          fused: true
+          betas: [0.9, 0.99]
+          eps: 1.e-6
+          weight_decay: 1.e-2
+      scheduler:
+        target: hy3dshape.utils.trainings.lr_scheduler.LambdaWarmUpCosineFactorScheduler
+        params:
+          warm_up_steps: 500
+          f_start: 1.e-6
+          f_min: 1.e-3
+          f_max: 1.0
+
+    pipeline_cfg:
+      target: hy3dshape.pipelines.CustomFlowMatchingPipeline
+      params:
+        pipeline_output: "image"    # tells pipeline to decode to images, not meshes
+
+callbacks:
+  image_logger:
+    target: hy3dshape.utils.trainings.image_log_callback.ImageLogger
+    params:
+      step_frequency: 5000        # sync with val interval
+      num_samples: 4
